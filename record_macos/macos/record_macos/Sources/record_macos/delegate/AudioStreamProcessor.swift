@@ -4,6 +4,11 @@ import AVFoundation
 /// PCM format conversion, amplitude tracking, and encoding (AAC or PCM16).
 class AudioStreamProcessor {
   private let m_converter: AVAudioConverter
+  /// Set when the input has more channels than the output: AVAudioConverter
+  /// maps none of them (channelMap [-1]) and outputs silence, e.g. on the
+  /// 3-channel built-in microphone of Apple Silicon MacBooks. Its leading
+  /// channels are copied into this format before conversion instead.
+  private let m_channelSubset: AVAudioFormat?
   private let m_encoder: AudioEnc
   private var m_amplitude: Float = -160.0
 
@@ -20,7 +25,10 @@ class AudioStreamProcessor {
       )
     }
 
-    guard let converter = AVAudioConverter(from: srcFormat, to: outputFormat) else {
+    let channelSubset = AudioStreamProcessor.channelSubsetFormat(src: srcFormat, output: outputFormat)
+    m_channelSubset = channelSubset
+
+    guard let converter = AVAudioConverter(from: channelSubset ?? srcFormat, to: outputFormat) else {
       throw RecorderError.error(
         message: "Failed to start recording",
         details: "Format conversion is not possible."
@@ -58,7 +66,36 @@ class AudioStreamProcessor {
 
   // MARK: - Private
 
+  private static func channelSubsetFormat(src: AVAudioFormat, output: AVAudioFormat) -> AVAudioFormat? {
+    guard src.channelCount > output.channelCount,
+          src.commonFormat == .pcmFormatFloat32,
+          !src.isInterleaved else { return nil }
+    return AVAudioFormat(
+      commonFormat: .pcmFormatFloat32,
+      sampleRate: src.sampleRate,
+      channels: output.channelCount,
+      interleaved: false
+    )
+  }
+
+  /// Copies the leading channels of [buffer] into [format].
+  private func subset(_ buffer: AVAudioPCMBuffer, to format: AVAudioFormat) -> AVAudioPCMBuffer? {
+    guard let source = buffer.floatChannelData,
+          let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: buffer.frameLength),
+          let target = out.floatChannelData else { return nil }
+    out.frameLength = buffer.frameLength
+    for channel in 0..<Int(format.channelCount) {
+      target[channel].update(from: source[channel], count: Int(buffer.frameLength))
+    }
+    return out
+  }
+
   private func convertBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    var buffer = buffer
+    if let format = m_channelSubset {
+      guard let subset = subset(buffer, to: format) else { return nil }
+      buffer = subset
+    }
     let capacity = AVAudioFrameCount(
       Double(buffer.frameLength) * m_converter.outputFormat.sampleRate / buffer.format.sampleRate
     )
